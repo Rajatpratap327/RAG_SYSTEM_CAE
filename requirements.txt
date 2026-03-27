@@ -11,14 +11,14 @@ langchain-chroma==0.1.4
 langchain-ollama==0.2.2
 
 # ── Vector store ─────────────────────────────────────────────────────────────
-chromadb==0.6.3
+chromadb==0.5.23
 
 # ── PDF parsing ──────────────────────────────────────────────────────────────
 docling==2.15.0
-docling-core==2.10.0
+docling-core==2.15.0
 
 # ── Image processing ─────────────────────────────────────────────────────────
-Pillow==11.1.0
+Pillow==10.4.0
 
 # ── HTTP client (Ollama API calls) ───────────────────────────────────────────
 httpx==0.28.1
