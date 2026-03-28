@@ -75,26 +75,36 @@ def parse_pdf(file_path: str | Path) -> dict[str, Any]:
     text_count = table_count = image_count = 0
 
     # ── 1. Text chunks ────────────────────────────────────────────────────
+    # Text splitter to avoid exceeding embedding context window
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=800,
+        chunk_overlap=100,
+    )
+
     for i, text_item in enumerate(doc.texts):
         content = text_item.text.strip()
-        if not content or len(content) < 20:  # Skip trivially short fragments
+        if not content or len(content) < 20:
             continue
         page_no = (
             text_item.prov[0].page_no if text_item.prov else 0
         )
-        chunks.append(
-            {
-                "text": content,
-                "metadata": {
-                    "source": filename,
-                    "page": page_no,
-                    "chunk_type": TEXT_CHUNK,
-                    "chunk_index": i,
-                },
-                "chunk_id": _make_chunk_id(filename, i, TEXT_CHUNK),
-            }
-        )
-        text_count += 1
+        # Split long text blocks into smaller chunks
+        sub_chunks = splitter.split_text(content)
+        for j, sub in enumerate(sub_chunks):
+            chunks.append(
+                {
+                    "text": sub,
+                    "metadata": {
+                        "source": filename,
+                        "page": page_no,
+                        "chunk_type": TEXT_CHUNK,
+                        "chunk_index": i * 100 + j,
+                    },
+                    "chunk_id": _make_chunk_id(filename, i * 100 + j, TEXT_CHUNK),
+                }
+            )
+            text_count += 1
 
     # ── 2. Table chunks ───────────────────────────────────────────────────
     for i, item in enumerate(doc.tables):
