@@ -60,12 +60,10 @@ def summarise_image(
         response = httpx.post(
             f"{OLLAMA_BASE_URL}/api/generate",
             json=payload,
-            timeout=300.0,  # VLM inference can be slow on CPU
+            timeout=600.0,  # VLM inference can be slow on CPU
         )
         response.raise_for_status()
         data = response.json()
         return data.get("response", "").strip()
     except httpx.HTTPError as exc:
-        raise RuntimeError(
-            f"VLM inference failed for image from '{source_filename}': {exc}"
-        ) from exc
+        return f"[Image from {source_filename} - VLM unavailable: {exc}]"
