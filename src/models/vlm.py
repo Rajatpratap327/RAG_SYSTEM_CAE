@@ -60,7 +60,7 @@ def summarise_image(
         response = httpx.post(
             f"{OLLAMA_BASE_URL}/api/generate",
             json=payload,
-            timeout=120.0,  # VLM inference can be slow on CPU
+            timeout=300.0,  # VLM inference can be slow on CPU
         )
         response.raise_for_status()
         data = response.json()

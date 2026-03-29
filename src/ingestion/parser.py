@@ -16,7 +16,8 @@ from docling.datamodel.pipeline_options import (
     EasyOcrOptions,
 )
 from docling.document_converter import DocumentConverter, PdfFormatOption
-from docling_core.types.doc import ImageRefMode, PictureItem, TableItem
+from docling_core.types.doc import PictureItem, TableItem
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 from src.config import IMAGE_CACHE_DIR, MAX_IMAGE_DIM
 from src.models.vlm import summarise_image
@@ -26,6 +27,14 @@ from src.models.vlm import summarise_image
 TEXT_CHUNK = "text"
 TABLE_CHUNK = "table"
 IMAGE_CHUNK = "image"
+
+# ── Text splitter (shared for text and table chunks) ─────────────────────────
+# nomic-embed-text has a ~2048 token context; 800 chars ≈ safe limit
+_SPLITTER = RecursiveCharacterTextSplitter(
+    chunk_size=800,
+    chunk_overlap=100,
+    separators=["\n\n", "\n", " ", ""],
+)
 
 
 def _make_chunk_id(source: str, index: int, chunk_type: str) -> str:
@@ -75,22 +84,12 @@ def parse_pdf(file_path: str | Path) -> dict[str, Any]:
     text_count = table_count = image_count = 0
 
     # ── 1. Text chunks ────────────────────────────────────────────────────
-    # Text splitter to avoid exceeding embedding context window
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=800,
-        chunk_overlap=100,
-    )
-
     for i, text_item in enumerate(doc.texts):
         content = text_item.text.strip()
         if not content or len(content) < 20:
             continue
-        page_no = (
-            text_item.prov[0].page_no if text_item.prov else 0
-        )
-        # Split long text blocks into smaller chunks
-        sub_chunks = splitter.split_text(content)
+        page_no = text_item.prov[0].page_no if text_item.prov else 0
+        sub_chunks = _SPLITTER.split_text(content)
         for j, sub in enumerate(sub_chunks):
             chunks.append(
                 {
@@ -119,20 +118,23 @@ def parse_pdf(file_path: str | Path) -> dict[str, Any]:
         page_no = item.prov[0].page_no if item.prov else 0
         caption = getattr(item, "caption", "") or ""
 
-        chunks.append(
-            {
-                "text": f"TABLE CONTENT:\n{table_text}\nCaption: {caption}",
-                "metadata": {
-                    "source": filename,
-                    "page": page_no,
-                    "chunk_type": TABLE_CHUNK,
-                    "chunk_index": i,
-                    "caption": caption,
-                },
-                "chunk_id": _make_chunk_id(filename, i, TABLE_CHUNK),
-            }
-        )
-        table_count += 1
+        full_text = f"TABLE CONTENT:\n{table_text}\nCaption: {caption}"
+        sub_chunks = _SPLITTER.split_text(full_text)
+        for j, sub in enumerate(sub_chunks):
+            chunks.append(
+                {
+                    "text": sub,
+                    "metadata": {
+                        "source": filename,
+                        "page": page_no,
+                        "chunk_type": TABLE_CHUNK,
+                        "chunk_index": i * 100 + j,
+                        "caption": caption,
+                    },
+                    "chunk_id": _make_chunk_id(filename, i * 100 + j, TABLE_CHUNK),
+                }
+            )
+            table_count += 1
 
     # ── 3. Image chunks (VLM summarisation) ──────────────────────────────
     image_cache = Path(IMAGE_CACHE_DIR)
