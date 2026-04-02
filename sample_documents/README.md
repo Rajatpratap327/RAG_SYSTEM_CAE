@@ -1,0 +1,1 @@
+Sample document: IJSER151593.pdf — Bolt analysis paper with text, tables, and images.
