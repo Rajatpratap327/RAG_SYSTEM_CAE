@@ -54,13 +54,16 @@ def summarise_image(
         "prompt": prompt_text,
         "images": [image_b64],
         "stream": False,
+        "options": {
+            "num_ctx": 512,
+        }
     }
 
     try:
         response = httpx.post(
             f"{OLLAMA_BASE_URL}/api/generate",
             json=payload,
-            timeout=600.0,  # VLM inference can be slow on CPU
+            timeout=300.0,  # VLM inference can be slow on CPU
         )
         response.raise_for_status()
         data = response.json()
