@@ -1,35 +1,47 @@
 """
+parser.py
+
 PDF ingestion pipeline using Docling.
-Extracts text blocks, tables, and images as distinct chunk types,
-enabling modality-aware retrieval in the RAG pipeline.
+
+Extracts:
+- Text blocks
+- Tables
+- Images (summarised using VLM)
+
+Designed for multimodal RAG pipelines.
 """
 
 import base64
 import hashlib
+import io
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List
 
 from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import (
-    PdfPipelineOptions,
-    EasyOcrOptions,
-)
+from docling.datamodel.pipeline_options import PdfPipelineOptions, EasyOcrOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling_core.types.doc import PictureItem, TableItem
+
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 from src.config import IMAGE_CACHE_DIR, MAX_IMAGE_DIM
 from src.models.vlm import summarise_image
 
 
-# ── Chunk type literals ──────────────────────────────────────────────────────
+# ============================================================
+# Chunk Types
+# ============================================================
+
 TEXT_CHUNK = "text"
 TABLE_CHUNK = "table"
 IMAGE_CHUNK = "image"
 
-# ── Text splitter (shared for text and table chunks) ─────────────────────────
-# nomic-embed-text has a ~2048 token context; 800 chars ≈ safe limit
+
+# ============================================================
+# Text Splitter
+# ============================================================
+
 _SPLITTER = RecursiveCharacterTextSplitter(
     chunk_size=800,
     chunk_overlap=100,
@@ -37,60 +49,78 @@ _SPLITTER = RecursiveCharacterTextSplitter(
 )
 
 
+# ============================================================
+# Utilities
+# ============================================================
+
 def _make_chunk_id(source: str, index: int, chunk_type: str) -> str:
-    """Generate a deterministic chunk ID from source filename, index, and type."""
     raw = f"{source}::{chunk_type}::{index}"
     return hashlib.md5(raw.encode()).hexdigest()
 
 
 def _build_docling_converter() -> DocumentConverter:
-    """Configure and return a Docling DocumentConverter with OCR and image export."""
-    pipeline_options = PdfPipelineOptions()
-    pipeline_options.do_ocr = True
-    pipeline_options.ocr_options = EasyOcrOptions(force_full_page_ocr=False)
-    pipeline_options.generate_picture_images = True
-    pipeline_options.images_scale = 2.0  # Higher resolution for VLM input
+    """Create Docling converter with OCR + image extraction."""
+
+    options = PdfPipelineOptions()
+
+    options.do_ocr = True
+    options.ocr_options = EasyOcrOptions(force_full_page_ocr=False)
+
+    # IMPORTANT for VLM
+    options.generate_picture_images = True
+    options.images_scale = 2.0
 
     return DocumentConverter(
         format_options={
-            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+            InputFormat.PDF: PdfFormatOption(pipeline_options=options)
         }
     )
 
 
-def parse_pdf(file_path: str | Path) -> dict[str, Any]:
-    """
-    Parse a PDF file and extract text, table, and image chunks.
+# ============================================================
+# MAIN PARSER
+# ============================================================
 
-    Args:
-        file_path: Path to the PDF file.
+def parse_pdf(file_path: str | Path) -> Dict[str, Any]:
 
-    Returns:
-        Dictionary with keys:
-            - 'chunks': list of chunk dicts (text, metadata)
-            - 'stats': ingestion summary statistics
-    """
     file_path = Path(file_path)
-    if not file_path.exists():
-        raise FileNotFoundError(f"PDF not found: {file_path}")
 
-    t0 = time.time()
+    if not file_path.exists():
+        raise FileNotFoundError(file_path)
+
+    print(f"\n📄 Parsing PDF: {file_path.name}")
+
+    start_time = time.time()
+
     converter = _build_docling_converter()
     result = converter.convert(str(file_path))
     doc = result.document
+
     filename = file_path.name
+    chunks: List[Dict] = []
 
-    chunks: list[dict[str, Any]] = []
-    text_count = table_count = image_count = 0
+    text_count = 0
+    table_count = 0
+    image_count = 0
 
-    # ── 1. Text chunks ────────────────────────────────────────────────────
+    # ============================================================
+    # 1️⃣ TEXT
+    # ============================================================
+
     for i, text_item in enumerate(doc.texts):
-        content = text_item.text.strip()
-        if not content or len(content) < 20:
+
+        content = (text_item.text or "").strip()
+
+        if len(content) < 20:
             continue
+
         page_no = text_item.prov[0].page_no if text_item.prov else 0
+
         sub_chunks = _SPLITTER.split_text(content)
+
         for j, sub in enumerate(sub_chunks):
+            idx = i * 100 + j
+
             chunks.append(
                 {
                     "text": sub,
@@ -98,29 +128,36 @@ def parse_pdf(file_path: str | Path) -> dict[str, Any]:
                         "source": filename,
                         "page": page_no,
                         "chunk_type": TEXT_CHUNK,
-                        "chunk_index": i * 100 + j,
+                        "chunk_index": idx,
                     },
-                    "chunk_id": _make_chunk_id(filename, i * 100 + j, TEXT_CHUNK),
+                    "chunk_id": _make_chunk_id(filename, idx, TEXT_CHUNK),
                 }
             )
             text_count += 1
 
-    # ── 2. Table chunks ───────────────────────────────────────────────────
-    for i, item in enumerate(doc.tables):
-        if not isinstance(item, TableItem):
+    # ============================================================
+    # 2️⃣ TABLES
+    # ============================================================
+
+    for i, table in enumerate(doc.tables):
+
+        if not isinstance(table, TableItem):
             continue
+
         try:
-            df = item.export_to_dataframe()
+            df = table.export_to_dataframe()
             table_text = df.to_markdown(index=False)
         except Exception:
-            table_text = str(item)
+            table_text = str(table)
 
-        page_no = item.prov[0].page_no if item.prov else 0
-        caption = getattr(item, "caption", "") or ""
+        caption = getattr(table, "caption", "") or ""
+        page_no = table.prov[0].page_no if table.prov else 0
 
-        full_text = f"TABLE CONTENT:\n{table_text}\nCaption: {caption}"
-        sub_chunks = _SPLITTER.split_text(full_text)
-        for j, sub in enumerate(sub_chunks):
+        combined = f"TABLE CONTENT:\n{table_text}\nCaption: {caption}"
+
+        for j, sub in enumerate(_SPLITTER.split_text(combined)):
+            idx = i * 100 + j
+
             chunks.append(
                 {
                     "text": sub,
@@ -128,48 +165,61 @@ def parse_pdf(file_path: str | Path) -> dict[str, Any]:
                         "source": filename,
                         "page": page_no,
                         "chunk_type": TABLE_CHUNK,
-                        "chunk_index": i * 100 + j,
                         "caption": caption,
+                        "chunk_index": idx,
                     },
-                    "chunk_id": _make_chunk_id(filename, i * 100 + j, TABLE_CHUNK),
+                    "chunk_id": _make_chunk_id(filename, idx, TABLE_CHUNK),
                 }
             )
             table_count += 1
 
-    # ── 3. Image chunks (VLM summarisation) ──────────────────────────────
+    # ============================================================
+    # 3️⃣ IMAGES → VLM
+    # ============================================================
+
     image_cache = Path(IMAGE_CACHE_DIR)
     image_cache.mkdir(parents=True, exist_ok=True)
 
-    for i, item in enumerate(doc.pictures):
-        if not isinstance(item, PictureItem):
+    for i, picture in enumerate(doc.pictures):
+
+        if not isinstance(picture, PictureItem):
             continue
+
         try:
-            # Export image as PNG bytes
-            img = item.get_image(doc)
+            print(f"🖼 Processing image {i}")
+
+            img = picture.get_image(doc)
+
             if img is None:
+                print("⚠️ No image extracted")
                 continue
 
-            # Resize if oversized
+            # resize large images
             w, h = img.size
             if max(w, h) > MAX_IMAGE_DIM:
                 scale = MAX_IMAGE_DIM / max(w, h)
                 img = img.resize((int(w * scale), int(h * scale)))
 
-            # Save to cache for debugging / auditing
+            # save debug image
             img_path = image_cache / f"{filename}_img_{i}.png"
             img.save(img_path)
 
-            # Convert to base64 for VLM
-            import io
+            # convert → base64
             buf = io.BytesIO()
             img.save(buf, format="PNG")
-            b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+            image_b64 = base64.b64encode(buf.getvalue()).decode()
 
-            # Ask VLM to describe the image in CAE context
-            summary = summarise_image(b64, source_filename=filename)
+            print("🚀 Calling VLM summariser...")
 
-            page_no = item.prov[0].page_no if item.prov else 0
-            caption = getattr(item, "caption", "") or ""
+            summary = summarise_image(
+                image_b64,
+                source_filename=filename,
+            )
+
+            print("✅ VLM returned summary")
+
+            caption = getattr(picture, "caption", "") or ""
+            page_no = picture.prov[0].page_no if picture.prov else 0
 
             chunks.append(
                 {
@@ -178,21 +228,26 @@ def parse_pdf(file_path: str | Path) -> dict[str, Any]:
                         "source": filename,
                         "page": page_no,
                         "chunk_type": IMAGE_CHUNK,
-                        "chunk_index": i,
                         "caption": caption,
                         "image_path": str(img_path),
+                        "chunk_index": i,
                     },
                     "chunk_id": _make_chunk_id(filename, i, IMAGE_CHUNK),
                 }
             )
+
             image_count += 1
 
-        except Exception as exc:
-            # Non-fatal: log and continue with remaining images
-            print(f"⚠️  Skipping image {i} in {filename}: {exc}")
+        except Exception as e:
+            print(f"❌ Image {i} failed: {e}")
             continue
 
-    elapsed = round(time.time() - t0, 2)
+    # ============================================================
+    # STATS
+    # ============================================================
+
+    elapsed = round(time.time() - start_time, 2)
+
     stats = {
         "filename": filename,
         "total_chunks": len(chunks),
@@ -202,4 +257,9 @@ def parse_pdf(file_path: str | Path) -> dict[str, Any]:
         "processing_time_seconds": elapsed,
     }
 
-    return {"chunks": chunks, "stats": stats}
+    print("✅ Parsing complete:", stats)
+
+    return {
+        "chunks": chunks,
+        "stats": stats,
+    }
