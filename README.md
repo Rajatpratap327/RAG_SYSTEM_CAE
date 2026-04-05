@@ -51,7 +51,7 @@ A successful system enables analysts to:
 
 - Query a corpus of FEA reports and receive grounded answers with page-level citations in under 30 seconds.
 - Ask table-specific questions such as "What torque preload was applied to M10 bolts in the load case 3 analysis?" and receive the exact value from the indexed table.
-- Ask image-specific questions such as "Where is the maximum stress concentration located in the component?" and receive a description grounded in the VLM-summarised contour plot.
+- Ask image-specific questions such as "What thread geometry parameters are shown in the diagram?" and receive a description grounded in the VLM-summarised engineering figure.
 - Perform cross-document synthesis: "Across all ingested durability reports, which component has the lowest fatigue safety factor?"
 
 ---
@@ -66,7 +66,7 @@ flowchart TD
     B --> C1[Text Blocks]
     B --> C2[Tables → Markdown]
     B --> C3[Images → PNG]
-    C3 --> D[LLaVA VLM\nOllama]
+    C3 --> D[minicpm-v VLM\nOllama]
     D --> E[Image Summary Text]
     C1 --> F[nomic-embed-text\nOllama]
     C2 --> F
@@ -99,7 +99,7 @@ flowchart TD
 │   Docling      │ │  ChromaDB  │ │  Ollama Models  │
 │   PDF Parser   │ │  (local    │ │                 │
 │   text/table/  │ │  chroma_db)│ │  mistral-nemo   │
-│   image chunks │ │            │ │  llava          │
+│   image chunks │ │            │ │  minicpm-v      │
 └────────────────┘ └────────────┘ │  nomic-embed    │
                                    └─────────────────┘
 ```
@@ -111,11 +111,12 @@ flowchart TD
 | Component | Choice | Justification |
 |---|---|---|
 | **Document Parser** | Docling 2.x | Native support for table extraction to DataFrame (→ Markdown), picture extraction as PIL images, and OCR via EasyOCR — all in one pipeline without stitching multiple tools. |
-| **Embedding Model** | `nomic-embed-text` (Ollama) | 768-dim embeddings, optimised for long-form retrieval, fully local with no API key required. Outperforms `all-MiniLM` on domain-specific retrieval benchmarks. |
+| **Embedding Model** | `nomic-embed-text` (Ollama) | 768-dim embeddings, optimised for long-form retrieval, fully local with no API key required. Outperforms `all-MiniLM` on domain-specific retrieval benchmarks. Chunk size capped at 800 characters to respect the model context window. |
 | **Vector Store** | ChromaDB | Native `where` clause metadata filtering enables retrieval by chunk type (`text`/`table`/`image`) without post-processing. Persistent on-disk storage without serialisation boilerplate. FAISS would require manual metadata management and lacks native filtering. |
-| **LLM** | Mistral-Nemo (Ollama) | 12B parameter model with 128k context window. Strong instruction following for grounded QA. Already validated in EWA project for CAE domain tasks. Fully on-premise — no data leaves the machine. |
-| **Vision Model** | LLaVA (Ollama) | Open-source VLM capable of describing engineering plots, contour maps, and geometry diagrams. Runs locally via Ollama with the same API pattern as the LLM. |
+| **LLM** | Mistral-Nemo (Ollama) | 12B parameter model with 128k context window. Strong instruction following for grounded QA. Fully on-premise — no data leaves the machine. Low temperature (0.1) used for deterministic engineering answers. |
+| **Vision Model** | minicpm-v (Ollama) | Chosen over LLaVA for significantly lower RAM requirements (~4.7GB vs ~8GB) making it viable on 8GB RAM systems. Produces detailed engineering image descriptions including thread geometry, bolt assembly diagrams, and mechanical schematics. Offline CMD inference used when server RAM is constrained. |
 | **Framework** | LangChain + FastAPI | LangChain provides the retriever abstraction over ChromaDB and the message interface for Ollama. FastAPI provides Pydantic schema validation, automatic Swagger docs, and async file handling. |
+| **Text Splitting** | RecursiveCharacterTextSplitter | Added to handle long text and table chunks that exceed nomic-embed-text context window. Chunk size 800 chars with 100 char overlap preserves context across splits. |
 
 ---
 
@@ -123,15 +124,22 @@ flowchart TD
 
 ### Prerequisites
 
-- Python 3.11+
+- Python 3.11+ (Python 3.14 may cause pandas compilation issues — 3.11 recommended)
 - [Ollama](https://ollama.com) installed and running
-- 16 GB RAM recommended (LLaVA is memory-intensive)
+- 8 GB RAM minimum (16 GB recommended for simultaneous VLM + LLM inference)
+- Windows Developer Mode enabled (required for Docling model symlinks on Windows)
 
-### Step 1 — Pull required Ollama models
+### Step 1 — Enable Windows Developer Mode (Windows only)
+
+Settings → System → For Developers → toggle **Developer Mode** ON → restart machine.
+
+This is required for Docling to create model symlinks in the HuggingFace cache.
+
+### Step 2 — Pull required Ollama models
 
 ```bash
 ollama pull mistral-nemo
-ollama pull llava
+ollama pull minicpm-v
 ollama pull nomic-embed-text
 ```
 
@@ -141,35 +149,41 @@ Verify all three are available:
 ollama list
 ```
 
-### Step 2 — Clone the repository
+### Step 3 — Clone the repository
 
 ```bash
 git clone https://github.com/YOUR_USERNAME/cae-rag-system.git
 cd cae-rag-system
 ```
 
-### Step 3 — Create and activate a virtual environment
+### Step 4 — Create and activate a virtual environment
 
 ```bash
-python -m venv venv
-source venv/bin/activate        # Linux / macOS
-# venv\Scripts\activate         # Windows
+python -m venv .venv
+
+# Windows
+.venv\Scripts\activate
+
+# Linux / macOS
+source .venv/bin/activate
 ```
 
-### Step 4 — Install dependencies
+### Step 5 — Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### Step 5 — Configure environment
+### Step 6 — Configure environment
 
 ```bash
-cp .env.example .env
-# Edit .env if your Ollama URL or model names differ from defaults
+copy .env.example .env        # Windows
+# cp .env.example .env        # Linux/macOS
 ```
 
-### Step 6 — Start the server
+Default `.env` values work out of the box. Edit only if your Ollama URL or model names differ.
+
+### Step 7 — Start the server
 
 ```bash
 python main.py
@@ -179,19 +193,28 @@ The server starts at `http://localhost:8000`.
 
 Visit `http://localhost:8000/docs` for the interactive Swagger UI.
 
-### Step 7 — Ingest the sample document
+### Step 8 — Ingest the sample document
 
+Via Swagger UI at `http://localhost:8000/docs` → POST /ingest → Try it out → upload PDF.
+
+Or via curl:
 ```bash
 curl -X POST http://localhost:8000/ingest \
-  -F "file=@sample_documents/vdi2230_fea_report_sample.pdf"
+  -F "file=@sample_documents/IJSER151593.pdf"
 ```
 
-### Step 8 — Run a test query
+> **Note on 8GB RAM systems:** Close all other applications before ingesting. minicpm-v requires ~4.7GB RAM. For best image description quality, run minicpm-v in CMD first to warm it up before starting the server:
+> ```bash
+> ollama run minicpm-v "ready"
+> ```
+> Then start the server in a second terminal immediately.
+
+### Step 9 — Run a test query
 
 ```bash
 curl -X POST http://localhost:8000/query \
   -H "Content-Type: application/json" \
-  -d '{"question": "What is the maximum von Mises stress reported in the analysis?"}'
+  -d '{"question": "What thread geometry parameters are defined in the bolt analysis?"}'
 ```
 
 ---
@@ -207,17 +230,17 @@ Returns system status, model configuration, and index statistics.
 {
   "status": "ok",
   "llm_model": "mistral-nemo",
-  "vlm_model": "llava",
+  "vlm_model": "minicpm-v",
   "embed_model": "nomic-embed-text",
-  "total_chunks": 147,
-  "unique_documents": 3,
+  "total_chunks": 100,
+  "unique_documents": 1,
   "chunk_type_breakdown": {
-    "text": 98,
-    "table": 31,
-    "image": 18
+    "text": 95,
+    "table": 1,
+    "image": 4
   },
-  "indexed_files": ["vdi2230_report.pdf", "knuckle_fea.pdf"],
-  "uptime_seconds": 342.5
+  "indexed_files": ["IJSER151593.pdf"],
+  "uptime_seconds": 124.3
 }
 ```
 
@@ -232,13 +255,13 @@ Upload a PDF file for parsing and indexing.
 **Response example:**
 ```json
 {
-  "message": "Successfully ingested 'vdi2230_report.pdf'",
-  "filename": "vdi2230_report.pdf",
-  "total_chunks": 54,
-  "text_chunks": 33,
-  "table_chunks": 12,
-  "image_chunks": 9,
-  "processing_time_seconds": 47.3
+  "message": "Successfully ingested 'IJSER151593.pdf'",
+  "filename": "IJSER151593.pdf",
+  "total_chunks": 100,
+  "text_chunks": 95,
+  "table_chunks": 1,
+  "image_chunks": 4,
+  "processing_time_seconds": 1109.17
 }
 ```
 
@@ -255,7 +278,7 @@ Query the indexed documents with a natural language question.
 **Request body:**
 ```json
 {
-  "question": "What safety factor against thread stripping is reported for the M12 bolt?",
+  "question": "What thread geometry parameters are defined for bolt analysis?",
   "top_k": 6,
   "chunk_type_filter": null
 }
@@ -266,14 +289,14 @@ Query the indexed documents with a natural language question.
 **Response example:**
 ```json
 {
-  "question": "What safety factor against thread stripping is reported for the M12 bolt?",
-  "answer": "According to Table 4 in the VDI 2230 analysis report, the safety factor against thread stripping for the M12 bolt (property class 10.9) is 2.34, which exceeds the minimum required value of 1.25 per VDI 2230 Section 5.5. [source: vdi2230_report.pdf, page 12, type: table]",
+  "question": "What thread geometry parameters are defined for bolt analysis?",
+  "answer": "The document defines the following thread geometry parameters for bolt analysis per VDI 2230: pitch diameter d2, minor diameter d1, major diameter d, root radius, flank angle, and thread height H. These parameters are used to compute shear stress area, preload capacity, and thread stripping safety factors. [source: IJSER151593.pdf, page 1, type: image]",
   "sources": [
     {
-      "source": "vdi2230_report.pdf",
-      "page": 12,
-      "chunk_type": "table",
-      "caption": "Table 4: VDI 2230 Safety Factor Summary"
+      "source": "IJSER151593.pdf",
+      "page": 1,
+      "chunk_type": "image",
+      "caption": ""
     }
   ],
   "retrieved_chunks": 6
@@ -289,8 +312,8 @@ List all currently indexed documents.
 **Response example:**
 ```json
 {
-  "indexed_files": ["vdi2230_report.pdf", "knuckle_fea_q3.pdf"],
-  "total_documents": 2
+  "indexed_files": ["IJSER151593.pdf"],
+  "total_documents": 1
 }
 ```
 
@@ -300,14 +323,14 @@ List all currently indexed documents.
 
 Remove all chunks for a specific document from the index.
 
-**Example:** `DELETE /documents/vdi2230_report.pdf`
+**Example:** `DELETE /documents/IJSER151593.pdf`
 
 **Response example:**
 ```json
 {
-  "message": "Successfully removed 'vdi2230_report.pdf' from the index.",
-  "filename": "vdi2230_report.pdf",
-  "chunks_deleted": 54
+  "message": "Successfully removed 'IJSER151593.pdf' from the index.",
+  "filename": "IJSER151593.pdf",
+  "chunks_deleted": 100
 }
 ```
 
@@ -321,16 +344,16 @@ FastAPI auto-generated Swagger/OpenAPI UI. Access at `http://localhost:8000/docs
 
 ## 6. Screenshots
 
-> Screenshots are located in the `screenshots/` folder.
+> All screenshots are located in the `screenshots/` folder.
 
-| # | Screenshot | Description |
+| # | File | Description |
 |---|---|---|
-| 1 | `screenshots/01_swagger_ui.png` | `/docs` Swagger UI showing all endpoints |
-| 2 | `screenshots/02_ingest_response.png` | POST `/ingest` with multimodal PDF — chunk count response |
-| 3 | `screenshots/03_text_query.png` | Query retrieving a text chunk result |
-| 4 | `screenshots/04_table_query.png` | Query retrieving a table chunk with VDI 2230 values |
-| 5 | `screenshots/05_image_query.png` | Query retrieving an image-summary chunk (FEA contour plot) |
-| 6 | `screenshots/06_health_endpoint.png` | `/health` response showing indexed document count |
+| 1 | `screenshots/01_swagger_ui.png` | `/docs` Swagger UI showing all 5 endpoints |
+| 2 | `screenshots/02_ingest_response.png` | POST `/ingest` response — 100 chunks (95 text, 1 table, 4 image) |
+| 3 | `screenshots/03_text_query.png` | Text chunk query result with source references |
+| 4 | `screenshots/04_table_query.png` | Table chunk query with `chunk_type_filter: "table"` |
+| 5 | `screenshots/05_image_query.png` | Image chunk query with `chunk_type_filter: "image"` |
+| 6 | `screenshots/06_health_endpoint.png` | `/health` response showing 100 indexed chunks |
 
 ---
 
@@ -338,21 +361,24 @@ FastAPI auto-generated Swagger/OpenAPI UI. Access at `http://localhost:8000/docs
 
 ### Current Limitations
 
-- **VLM inference speed:** LLaVA image summarisation runs on CPU by default and can take 30–90 seconds per image. PDFs with many figures will have long ingestion times. A GPU-equipped machine with CUDA reduces this significantly.
+- **VLM RAM constraint:** minicpm-v requires ~4.7GB RAM. On 8GB systems, the Python server and minicpm-v cannot run simultaneously. Workaround implemented: VLM is run offline via CMD before server startup to warm up RAM, or manual descriptions are used as a fallback for known documents. A GPU-equipped machine eliminates this constraint entirely.
+- **Image description quality:** When VLM times out, a structured placeholder description is stored for image chunks. While the placeholder preserves retrieval capability, it reduces image query answer quality compared to real VLM inference.
 - **OCR quality:** Docling's EasyOCR is effective for printed text but degrades on low-resolution scanned PDFs or documents with complex multi-column layouts common in older SAE/VDI standards.
-- **Context window constraints:** Mistral-Nemo's 128k context is large, but very long documents can still produce more chunks than fit in a single generation call. Currently, retrieval is capped at `top_k=20`.
-- **No re-ranking:** Retrieved chunks are ranked purely by cosine similarity of embeddings. A cross-encoder re-ranker (e.g., `ms-marco-MiniLM`) would improve precision, particularly for table retrieval.
-- **Single-turn QA only:** The current `/query` endpoint does not maintain conversational context between calls. Each query is stateless.
+- **Context window constraints:** nomic-embed-text context is limited — chunks are capped at 800 characters. Very long tables are split across multiple chunks which may reduce table retrieval precision.
+- **No re-ranking:** Retrieved chunks are ranked purely by cosine similarity. A cross-encoder re-ranker (e.g., `ms-marco-MiniLM`) would improve precision, particularly for table retrieval.
+- **Single-turn QA only:** The `/query` endpoint does not maintain conversational context between calls. Each query is stateless.
 - **No authentication:** The API has no access control. In a production deployment, OAuth2 or API key middleware should be added.
+- **Windows symlink requirement:** Docling requires Windows Developer Mode to create HuggingFace model symlinks. This is a one-time setup step but may be a barrier in enterprise environments.
 
 ### Future Work
 
-- **GPU acceleration:** Containerise with NVIDIA CUDA base image to accelerate LLaVA and embedding inference.
+- **GPU acceleration:** Containerise with NVIDIA CUDA base image to run minicpm-v and mistral-nemo simultaneously without RAM constraints.
 - **Re-ranking layer:** Add a cross-encoder re-ranker between retrieval and generation to improve answer quality on ambiguous queries.
 - **Conversational memory:** Add a `/chat` endpoint that maintains session-level conversation history using LangChain's `ConversationBufferMemory`.
-- **Structured output parsing:** For table queries, return structured JSON values rather than prose — enabling downstream integration with calculation tools like the EWA VDI 2230 calculator.
+- **Structured output parsing:** For table queries, return structured JSON values rather than prose — enabling downstream integration with engineering calculation tools.
 - **Evaluation harness:** Implement RAGAS-based automatic evaluation (faithfulness, context recall, answer relevancy) against a manually curated golden QA set from real CAE reports.
-- **Multi-vector retrieval:** Embed table summaries and raw table markdown separately; retrieve both and let the LLM choose which representation to use for answer generation.
+- **Multi-vector retrieval:** Embed table summaries and raw table markdown separately to improve table retrieval precision.
+- **Docker deployment:** Package the entire stack (FastAPI + Ollama + ChromaDB) in Docker Compose for one-command deployment on any machine.
 
 ---
 
